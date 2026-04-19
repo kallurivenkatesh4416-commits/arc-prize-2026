@@ -1,0 +1,3 @@
+arc-agi>=0.1
+anthropic>=0.40
+python-dotenv>=1.0
