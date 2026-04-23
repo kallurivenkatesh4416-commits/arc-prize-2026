@@ -103,6 +103,8 @@ class WorldModel:
     score_events: list[ScoreEvent] = field(default_factory=list)
     goal_hypotheses: list[Hypothesis] = field(default_factory=list)
     frame_history: deque = field(default_factory=lambda: deque(maxlen=16))
+    last_prev_grid: list[list[int]] | None = None
+    last_action: str = ""
     turn: int = 0
     current_score: int = 0
     game_id: str = ""
@@ -128,6 +130,8 @@ class WorldModel:
                 ScoreEvent(self.turn, score_before, score_after, action)
             )
         self.frame_history.append(next_frame)
+        self.last_prev_grid = [row[:] for row in prev_grid] if prev_grid else None
+        self.last_action = action
         self.current_score = score_after
         self.turn += 1
         return transition
@@ -179,11 +183,22 @@ class WorldModel:
                 lines.append(f"  turn {ev.turn:4d}  {ev.action:>14}  {ev.score_before} -> {ev.score_after}")
 
         last_frame = self.frame_history[-1] if self.frame_history else None
-        if last_frame is not None:
-            grid = grid_of(last_frame)
-            if grid is not None:
-                lines.append("\nLATEST GRID:")
-                lines.append(render_grid(grid))
+        curr_grid = grid_of(last_frame) if last_frame is not None else None
+        prev_grid = self.last_prev_grid
+
+        if self.last_action and prev_grid is not None and curr_grid is not None:
+            lines.append(f"\nLAST TRANSITION: {self.last_action}")
+            lines.append("BEFORE:")
+            lines.append(render_grid(prev_grid))
+            lines.append("AFTER:")
+            lines.append(render_grid(curr_grid))
+            diff = render_diff(prev_grid, curr_grid)
+            if diff:
+                lines.append("DIFF (* = changed cell):")
+                lines.append(diff)
+        elif curr_grid is not None:
+            lines.append("\nCURRENT GRID:")
+            lines.append(render_grid(curr_grid))
 
         text = "\n".join(lines)
         if len(text) > max_chars:
@@ -216,3 +231,27 @@ def _cell_char(value: int) -> str:
     if 10 <= value <= 15:
         return table[value - 10]
     return "?"
+
+
+def render_diff(prev: list[list[int]], curr: list[list[int]]) -> str:
+    if not prev or not curr:
+        return ""
+    h = max(len(prev), len(curr))
+    width = max(
+        max((len(r) for r in prev), default=0),
+        max((len(r) for r in curr), default=0),
+    )
+    if width == 0:
+        return ""
+    header = "   " + "".join(f"{c % 10}" for c in range(width))
+    rows = [header]
+    for r in range(h):
+        prev_row = prev[r] if r < len(prev) else []
+        curr_row = curr[r] if r < len(curr) else []
+        chars = []
+        for c in range(width):
+            pv = prev_row[c] if c < len(prev_row) else None
+            cv = curr_row[c] if c < len(curr_row) else None
+            chars.append("*" if pv != cv else ".")
+        rows.append(f"{r:2d} " + "".join(chars))
+    return "\n".join(rows)

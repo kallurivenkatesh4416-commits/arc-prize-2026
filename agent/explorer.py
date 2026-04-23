@@ -149,13 +149,52 @@ def probe_action_effects(env: Any, world: WorldModel, budget_steps: int = 40) ->
     return transitions
 
 
+def _centroid(obj: ObjectTrace) -> tuple[int, int]:
+    x0, y0, x1, y1 = obj.bbox
+    return ((x0 + x1) // 2, (y0 + y1) // 2)
+
+
+def sample_action6_on_objects(
+    env: Any,
+    world: WorldModel,
+    objects: list[ObjectTrace],
+    budget_clicks: int = 16,
+) -> list[tuple[int, int]]:
+    """Click the centroid of each detected object. Far cheaper and higher-signal
+    than a blind grid scan: targets the ~5-15 things that actually exist."""
+    live: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    frame = _reset(env)
+    clicks = 0
+
+    for obj in objects:
+        if clicks >= budget_clicks:
+            break
+        coord = _centroid(obj)
+        if coord in seen:
+            continue
+        seen.add(coord)
+        x, y = coord
+        try:
+            next_frame = _step(env, CLICK_ACTION, x, y)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ACTION6(%d,%d) raised %s", x, y, exc)
+            continue
+        t = world.update(frame, f"ACTION6({x},{y})", next_frame)
+        clicks += 1
+        if t.changed_cells > 0 or t.score_delta != 0:
+            live.append(coord)
+        frame = _reset(env)
+    return live
+
+
 def sample_action6_grid(
     env: Any,
     world: WorldModel,
-    stride: int = 8,
-    budget_clicks: int = 64,
+    stride: int = 16,
+    budget_clicks: int = 16,
 ) -> list[tuple[int, int]]:
-    """Sparse scan of the 64x64 grid, collecting coords whose click causes a change."""
+    """Fallback sparse scan when no objects are detected. Conservative budget."""
     live: list[tuple[int, int]] = []
     frame = _reset(env)
     clicks = 0
@@ -173,33 +212,47 @@ def sample_action6_grid(
             clicks += 1
             if t.changed_cells > 0 or t.score_delta != 0:
                 live.append((x, y))
-            if is_done(next_frame):
-                frame = _reset(env)
-            else:
-                frame = _reset(env)  # fresh baseline each click for clean attribution
+            frame = _reset(env)
     return live
 
 
-def run_probe(env: Any, game_id: str, stride: int = 8) -> tuple[WorldModel, ProbeReport]:
-    """Convenience: reset, probe directionals, sample clicks, extract objects."""
+def run_probe(env: Any, game_id: str, stride: int = 16) -> tuple[WorldModel, ProbeReport]:
+    """Convenience: reset, probe directionals, sample clicks, extract objects.
+
+    Tolerant of partial failures — returns whatever was gathered before a crash.
+    """
     world = WorldModel(game_id=game_id)
-    initial = _reset(env)
+    report = ProbeReport(game_id=game_id)
+    try:
+        initial = _reset(env)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("%s: initial reset failed: %s", game_id, exc)
+        return world, report
+
     world.current_score = score_of(initial)
     legal = available_actions(initial) or DIRECTIONAL + [CLICK_ACTION]
-    report = ProbeReport(
-        game_id=game_id,
-        legal_actions=legal,
-        initial_score=world.current_score,
-    )
+    report.legal_actions = legal
+    report.initial_score = world.current_score
 
-    report.directional_transitions = probe_action_effects(env, world)
+    try:
+        report.directional_transitions = probe_action_effects(env, world)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("%s: directional probe failed mid-flight: %s", game_id, exc)
+
+    initial_objects = detect_objects(grid_of(initial))
     if CLICK_ACTION in legal:
-        report.action6_live_coords = sample_action6_grid(env, world, stride=stride)
+        try:
+            if initial_objects:
+                report.action6_live_coords = sample_action6_on_objects(env, world, initial_objects)
+            else:
+                report.action6_live_coords = sample_action6_grid(env, world, stride=stride)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: ACTION6 probe failed mid-flight: %s", game_id, exc)
 
     latest = world.frame_history[-1] if world.frame_history else initial
     objects = detect_objects(grid_of(latest))
-    world.record_objects(objects)
-    report.objects = objects
+    world.record_objects(initial_objects + objects)
+    report.objects = world.objects_seen
     return world, report
 
 

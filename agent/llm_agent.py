@@ -43,22 +43,28 @@ ACTION_REGEX = re.compile(r"(RESET|ACTION[1-7])", re.IGNORECASE)
 SYSTEM_PROMPT = """You are playing an unknown turn-based puzzle game on a 2D grid.
 You were not told the rules, the goal, or the controls. You must figure them out.
 
-You see:
-- A compact text representation of the current grid (. = empty; 1..9,a..f = colors)
-- A list of legal actions for this turn
-- Your own running theories about the game
-- A summary of what each action has done so far
+You see each turn:
+- HYPOTHESES: your running theories, indexed. Update or invalidate them.
+- ACTION EFFECTS: for each action you've tried, sample count, avg Δscore, avg cells changed.
+- SCORE EVENTS: turns where score changed and which action caused it.
+- LAST TRANSITION: BEFORE grid, AFTER grid, and a DIFF mask (* = changed cell).
+  Study the diff carefully — it is the single clearest signal for what an action does.
+- Legal actions for THIS turn — not all games use all seven.
 
-Your job each turn: pick ONE action that best tests a theory or makes progress.
-When you learn something new, call update_theory. When a theory is falsified,
-call invalidate_theory. Only call reset_game if the game is over or you are
-certain you've reached a dead end.
+Grid notation: . = empty (0); 1..9 = colors 1..9; a..f = colors 10..15.
 
-Key heuristics:
-- If score increased after an action, that action is good — try it again.
-- If an action changed the grid, study the change; it's a clue.
-- Actions with zero effect are probably invalid right now — skip them.
-- ACTION6 takes (x, y) in 0..63; aim for visible objects, not empty cells.
+Your job each turn: call take_action with exactly one action that best tests a
+theory, replicates a score-increasing move, or rules out a hypothesis. When you
+learn something, call update_theory. When a theory is falsified by the diff,
+call invalidate_theory. Only reset_game if done or truly stuck.
+
+Heuristics:
+- Score increased last turn → repeat that action.
+- Action has avg_cells=0 across many samples → it's a no-op, skip.
+- ACTION6 takes (x, y) in 0..63; click cells that contain visible objects,
+  not empty background. The probe report lists live coordinates.
+- Prefer actions you've tested over unknowns ONLY if they're making progress.
+  If stuck, try an untested action — the unknown might be the breakthrough.
 """
 
 TOOLS = [
@@ -144,7 +150,10 @@ def _anthropic_client() -> Any:
 
 def _step(env: Any, action_name: str, *coords: int) -> Any:
     from arcengine import GameAction  # type: ignore
-    action = getattr(GameAction, action_name)
+    try:
+        action = getattr(GameAction, action_name)
+    except AttributeError as exc:
+        raise ValueError(f"GameAction has no attribute {action_name!r}") from exc
     if coords:
         return env.step(action, *coords)
     return env.step(action)
@@ -167,8 +176,15 @@ def _dispatch_tool(
         coords = ()
         label = action
         if action == CLICK_ACTION:
-            x = int(tool_input.get("x", 0))
-            y = int(tool_input.get("y", 0))
+            if "x" not in tool_input or "y" not in tool_input:
+                return "error: ACTION6 requires x and y (both 0..63)"
+            try:
+                x = int(tool_input["x"])
+                y = int(tool_input["y"])
+            except (TypeError, ValueError):
+                return f"error: ACTION6 x/y must be ints, got x={tool_input.get('x')!r} y={tool_input.get('y')!r}"
+            if not (0 <= x <= 63 and 0 <= y <= 63):
+                return f"error: ACTION6 x={x} y={y} out of range 0..63"
             coords = (x, y)
             label = f"ACTION6({x},{y})"
         prev = state["last_frame"]
@@ -255,8 +271,14 @@ def play_game(
     max_turns: int = DEFAULT_PER_GAME_TURNS,
     max_seconds: int = DEFAULT_PER_GAME_WALL_SECONDS,
     model: str = CLAUDE_MODEL,
+    transcript_path: str | None = None,
 ) -> GameResult:
     env = arc.make(game_id)
+
+    transcript_fp = None
+    if transcript_path:
+        os.makedirs(os.path.dirname(transcript_path) or ".", exist_ok=True)
+        transcript_fp = open(transcript_path, "a", encoding="utf-8")
 
     # Phase 1: scripted probe seeds the world model
     world, probe_report = run_probe(env, game_id)
@@ -274,6 +296,21 @@ def play_game(
         + probe_report.as_text()
     )
 
+    def _transcribe(event: str, **payload: Any) -> None:
+        if transcript_fp is None:
+            return
+        record = {
+            "ts": time.time(),
+            "game": game_id,
+            "event": event,
+            "turn": state["turns"],
+            "score": world.current_score,
+            **payload,
+        }
+        transcript_fp.write(json.dumps(record, default=str) + "\n")
+        transcript_fp.flush()
+
+    _transcribe("probe", report=probe_report.as_text())
     consecutive_noops = 0
 
     while state["turns"] < max_turns and not state["done"]:
@@ -330,6 +367,7 @@ def play_game(
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result_text}
                 )
+                _transcribe("tool_use", tool=block.name, input=dict(block.input), result=result_text)
                 if block.name == "take_action":
                     took_action = True
             messages.append({"role": "user", "content": tool_results})
@@ -343,8 +381,10 @@ def play_game(
                     "take_action", {"action": action}, env=env, world=world, state=state
                 )
                 messages.append({"role": "user", "content": [{"type": "text", "text": f"(regex-parsed) {result}"}]})
+                _transcribe("regex_action", text=text[:200], action=action, result=result)
                 took_action = True
             else:
+                _transcribe("no_action", text=text[:200])
                 log.debug("%s turn %d: no tool use and no action in text", game_id, state["turns"])
 
         if took_action:
@@ -362,7 +402,12 @@ def play_game(
                 _fallback_step(env, world, state)
             break
 
-    return GameResult(
+        # Wipe per-game conversation. World model carries state across turns;
+        # we don't need to ship N turns of history in every API call. Keeps
+        # per-turn token cost flat and maximizes cache hits on the primer.
+        messages = []
+
+    result = GameResult(
         game_id=game_id,
         final_score=world.current_score,
         turns_used=state["turns"],
@@ -370,6 +415,10 @@ def play_game(
         hypotheses=[h.text for h in world.goal_hypotheses],
         finished=state["done"],
     )
+    if transcript_fp is not None:
+        _transcribe("game_end", result=result.__dict__)
+        transcript_fp.close()
+    return result
 
 
 # -------- Top-level entry --------------------------------------------------
@@ -393,6 +442,7 @@ def run_competition(
     max_turns_per_game: int = DEFAULT_PER_GAME_TURNS,
     max_seconds_per_game: int = DEFAULT_PER_GAME_WALL_SECONDS,
     model: str = CLAUDE_MODEL,
+    transcript_dir: str | None = None,
 ) -> Scorecard:
     import arc_agi  # type: ignore
 
@@ -405,6 +455,9 @@ def run_competition(
     scorecard = Scorecard()
     for gid in game_ids:
         log.info("== playing %s ==", gid)
+        tpath = None
+        if transcript_dir:
+            tpath = os.path.join(transcript_dir, f"{gid}.jsonl")
         try:
             result = play_game(
                 arc,
@@ -412,6 +465,7 @@ def run_competition(
                 max_turns=max_turns_per_game,
                 max_seconds=max_seconds_per_game,
                 model=model,
+                transcript_path=tpath,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("game %s crashed: %s", gid, exc)
@@ -433,6 +487,7 @@ def _cli() -> None:
     parser.add_argument("--turns", type=int, default=DEFAULT_PER_GAME_TURNS, help="Claude turns per game")
     parser.add_argument("--model", default=CLAUDE_MODEL)
     parser.add_argument("--out", default=None, help="write scorecard JSON here")
+    parser.add_argument("--transcripts", default=None, help="directory for per-game JSONL transcripts")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -451,6 +506,7 @@ def _cli() -> None:
         max_turns_per_game=args.turns,
         max_seconds_per_game=args.budget,
         model=args.model,
+        transcript_dir=args.transcripts,
     )
     payload = scorecard.to_dict()
     print(json.dumps(payload, indent=2, default=str))
