@@ -176,6 +176,8 @@ class OfflineControllerAgent:
             transition=transition,
             next_frame=next_frame,
             elapsed_ms=elapsed_ms,
+            novel_state=transition.novel_next,
+            distinct_grids_seen=len(self.world.distinct_grid_hashes),
         )
 
     def _update_progress(self, transition: Transition) -> None:

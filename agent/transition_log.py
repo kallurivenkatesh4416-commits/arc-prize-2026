@@ -27,6 +27,8 @@ class TransitionLogger:
         transition: Transition,
         next_frame: Any,
         elapsed_ms: float,
+        novel_state: bool = False,
+        distinct_grids_seen: int = 0,
     ) -> None:
         record = {
             "ts": time.time(),
@@ -39,6 +41,8 @@ class TransitionLogger:
             "score": score_of(next_frame),
             "score_delta": transition.score_delta,
             "changed_cells": transition.changed_cells,
+            "novel_state": bool(novel_state),
+            "distinct_grids_seen": int(distinct_grids_seen),
             "levels_completed": _safe_attr(next_frame, "levels_completed", 0),
             "level_actions": _safe_attr(next_frame, "level_actions", []),
             "available_actions": available_actions(next_frame),

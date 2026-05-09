@@ -136,6 +136,8 @@ def main() -> int:
             "score",
             "score_delta",
             "changed_cells",
+            "novel_state",
+            "distinct_grids_seen",
             "levels_completed",
             "available_actions",
             "elapsed_ms",
@@ -143,6 +145,13 @@ def main() -> int:
         missing = required - set(records[0])
         if missing:
             failures.append(f"transition record missing keys: {sorted(missing)}")
+        if not any(rec.get("novel_state") for rec in records):
+            failures.append("no transition record reported novel_state=True")
+        final_distinct = records[-1].get("distinct_grids_seen", 0)
+        if final_distinct < 2:
+            failures.append(
+                f"final distinct_grids_seen <2 in transition log: {final_distinct}"
+            )
 
     if len(agent.world.distinct_grid_hashes) < 2:
         failures.append(

@@ -181,6 +181,7 @@ class Transition:
     score_delta: int
     changed_cells: int
     turn: int
+    novel_next: bool = False
 
     @property
     def grid_changed(self) -> bool:
@@ -247,9 +248,11 @@ class WorldModel:
         if prev_hash is not None:
             self.distinct_grid_hashes.add(prev_hash)
         next_hash = _grid_hash(next_grid)
-        if next_hash is not None and next_hash not in self.distinct_grid_hashes:
+        novel = next_hash is not None and next_hash not in self.distinct_grid_hashes
+        if novel:
             self.distinct_grid_hashes.add(next_hash)
             self.action_novelty[key] = self.action_novelty.get(key, 0) + 1
+        transition.novel_next = novel
         self.frame_history.append(next_frame)
         self.last_prev_grid = [row[:] for row in prev_grid] if prev_grid else None
         self.last_action = action
