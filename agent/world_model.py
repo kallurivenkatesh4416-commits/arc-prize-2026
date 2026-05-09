@@ -160,6 +160,21 @@ def _count_changed_cells(prev: list[list[int]] | None, curr: list[list[int]] | N
     return changed
 
 
+def _grid_hash(grid: list[list[int]] | None) -> int | None:
+    """Stable in-process hash of a 2D grid, or None for empty/missing.
+
+    Used by ``WorldModel`` to count distinct visited states and to attribute
+    novelty to whichever action produced each unseen state. Hash randomization
+    is fine because the value is only compared within a single process.
+    """
+    if not grid:
+        return None
+    try:
+        return hash(tuple(tuple(row) for row in grid))
+    except TypeError:
+        return None
+
+
 @dataclass
 class Transition:
     action: str
@@ -205,6 +220,8 @@ class WorldModel:
     turn: int = 0
     current_score: int = 0
     game_id: str = ""
+    distinct_grid_hashes: set[int] = field(default_factory=set)
+    action_novelty: dict[str, int] = field(default_factory=dict)
 
     def update(self, prev_frame: Any, action: str, next_frame: Any) -> Transition:
         prev_grid = grid_of(prev_frame)
@@ -226,6 +243,13 @@ class WorldModel:
             self.score_events.append(
                 ScoreEvent(self.turn, score_before, score_after, action)
             )
+        prev_hash = _grid_hash(prev_grid)
+        if prev_hash is not None:
+            self.distinct_grid_hashes.add(prev_hash)
+        next_hash = _grid_hash(next_grid)
+        if next_hash is not None and next_hash not in self.distinct_grid_hashes:
+            self.distinct_grid_hashes.add(next_hash)
+            self.action_novelty[key] = self.action_novelty.get(key, 0) + 1
         self.frame_history.append(next_frame)
         self.last_prev_grid = [row[:] for row in prev_grid] if prev_grid else None
         self.last_action = action

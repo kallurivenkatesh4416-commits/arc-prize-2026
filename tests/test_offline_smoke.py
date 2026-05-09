@@ -144,10 +144,20 @@ def main() -> int:
         if missing:
             failures.append(f"transition record missing keys: {sorted(missing)}")
 
+    if len(agent.world.distinct_grid_hashes) < 2:
+        failures.append(
+            f"world model recorded <2 distinct grid states: "
+            f"{len(agent.world.distinct_grid_hashes)}"
+        )
+    if not agent.world.action_novelty:
+        failures.append("world model recorded no per-action novelty hits")
+
     print(f"actions        = {env.actions}")
     print(f"distinct_probe = {sorted(distinct_probe)}")
     print(f"result         = {result.to_dict()}")
     print(f"transition_n   = {len(records)}")
+    print(f"distinct_grids = {len(agent.world.distinct_grid_hashes)}")
+    print(f"novelty        = {dict(agent.world.action_novelty)}")
 
     if failures:
         print("FAIL:")

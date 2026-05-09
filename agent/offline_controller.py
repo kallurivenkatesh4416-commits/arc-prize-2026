@@ -188,8 +188,16 @@ class OfflineControllerAgent:
         return (t.score_delta, t.changed_cells)
 
     def _rank_non_click_actions(self, legal: list[str]) -> list[str]:
+        """Rank by (avg_delta, novelty, avg_changed, name) descending.
+
+        Novelty is the count of previously-unseen grid states this action
+        produced (tracked in ``WorldModel.action_novelty``). It sits between
+        score_delta (the goal) and changed_cells (a noisier any-change signal)
+        so that when no action has scored, the agent still discriminates
+        between actions that open new state space and ones that no-op.
+        """
         legal_set = set(legal)
-        candidates: list[tuple[float, float, str]] = []
+        candidates: list[tuple[float, int, float, str]] = []
         for action_name, transitions in self.world.action_effects.items():
             if action_name == CLICK_ACTION or action_name in (RESET_ACTION, UNDO_ACTION):
                 continue
@@ -199,9 +207,10 @@ class OfflineControllerAgent:
                 continue
             avg_delta = sum(t.score_delta for t in transitions) / len(transitions)
             avg_changed = sum(t.changed_cells for t in transitions) / len(transitions)
-            candidates.append((avg_delta, avg_changed, action_name))
+            novelty = self.world.action_novelty.get(action_name, 0)
+            candidates.append((avg_delta, novelty, avg_changed, action_name))
         candidates.sort(reverse=True)
-        return [name for _, _, name in candidates]
+        return [name for _, _, _, name in candidates]
 
     def _rank_action6_coords(self) -> list[tuple[int, int]]:
         by_coord: dict[tuple[int, int], tuple[float, int]] = {}
