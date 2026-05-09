@@ -49,14 +49,14 @@ class FakeEnv:
 
     def __init__(self) -> None:
         self.size = 4
-        self._steps = 0
-        self._reward_used = False
         self._reset_state()
 
     def _reset_state(self) -> None:
         self.grid = [[0] * self.size for _ in range(self.size)]
         self.score = 0
         self.done = False
+        self._steps = 0
+        self._reward_used = False
         self.legal = ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION6"]
 
     def reset(self) -> dict:
@@ -111,8 +111,10 @@ def main() -> int:
     failures: list[str] = []
     if result.game_id != "smoke":
         failures.append(f"game_id mismatch: {result.game_id!r}")
-    if result.turns_used == 0:
-        failures.append("turns_used == 0; controller never stepped")
+    if result.turns_used < 3:
+        failures.append(
+            f"turns_used {result.turns_used} < 3; controller did not exercise multi-turn policy"
+        )
     if result.final_score < 1:
         failures.append(
             f"final_score {result.final_score} < 1; "
