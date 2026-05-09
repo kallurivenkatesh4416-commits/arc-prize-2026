@@ -10,23 +10,26 @@ The Claude-driven agent remains as an online research harness for generating tra
 
 ```
 agent/
-  explorer.py      scripted probe that maps actions to effects
-  world_model.py   evolving theory of the game
-  llm_agent.py     Claude tool-use loop
-  offline_controller.py  prize-eligible offline controller
-submission.ipynb   online research notebook (Claude-driven; not prize-safe)
+  explorer.py            pure helpers (object detection); probe loop now lives in offline_controller
+  world_model.py         evolving theory of the game (FrameData accessors)
+  llm_agent.py           Claude tool-use loop (LEGACY — parked, not used; kept for reference)
+  offline_controller.py  prize-eligible offline controller (arc_agi_3.Agent subclass)
+submission.ipynb         research notebook (uses SDK builtin LLM template via Swarm)
 submission_offline.ipynb prize-safe offline notebook
+tests/test_offline_smoke.py  runtime-free smoke test
 requirements.txt
-LICENSE            MIT-0
+LICENSE                  MIT-0
 ```
 
 ## Run locally
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env     # fill in ARC_API_KEY and ANTHROPIC_API_KEY
-python -m agent.llm_agent --game ls20
-python -m agent.offline_controller --game ls20
+Requires Python 3.12+. The `arc-agi-3` and `arcengine` packages don't support 3.10/3.11.
+
+```powershell
+py -3.12 -m venv .venv
+& .venv\Scripts\python.exe -m pip install -r requirements.txt
+cp .env.example .env     # fill in ARC_API_KEY (and ANTHROPIC_API_KEY for the research path)
+& .venv\Scripts\python.exe -m agent.offline_controller --game ls20 --card <card_id>
 ```
 
 ## Run on Kaggle
@@ -35,8 +38,8 @@ python -m agent.offline_controller --game ls20
 2. Open `submission_offline.ipynb` and click **Save & Run All**.
 3. Scorecard is written to `/kaggle/working/scorecard.json`.
 
-For online research runs only, use `submission.ipynb` with `ANTHROPIC_API_KEY`
-and internet enabled.
+For online research runs only, use `submission.ipynb` (uses the SDK's builtin
+`llm` template via `arc_agi_3.Swarm`).
 
 ## License
 
