@@ -1,8 +1,9 @@
 """Helpers for probing ARC-AGI-3 toolkit environments."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .world_model import (
     ObjectTrace,
@@ -138,6 +139,7 @@ def run_probe(
     initial_frame: Any | None = None,
     probe_budget: int = 24,
     max_probe_clicks: int = 8,
+    on_transition: Callable[[str, str, dict[str, Any] | None, Transition, Any, float], None] | None = None,
 ) -> tuple[WorldModel, ProbeReport, Any]:
     """Run a short scripted probe and return the updated world model."""
     world = world or WorldModel(game_id=game_id)
@@ -159,12 +161,16 @@ def run_probe(
         legal = legal_actions(env, current)
         if legal and action_name not in legal:
             continue
+        started_at = time.monotonic()
         outcome = step_action(
             env,
             action_name,
             reasoning={"phase": "probe", "kind": "directional", "action": action_name},
         )
+        elapsed_ms = (time.monotonic() - started_at) * 1000
         transition = world.update(current, action_name, outcome.frame)
+        if on_transition is not None:
+            on_transition("probe", action_name, None, transition, outcome.frame, elapsed_ms)
         report.directional_transitions.append(transition)
         current = outcome.frame
         steps += 1
@@ -190,13 +196,18 @@ def run_probe(
         legal = legal_actions(env, current)
         if legal and CLICK_ACTION not in legal:
             break
+        data = {"x": int(x), "y": int(y)}
+        started_at = time.monotonic()
         outcome = step_action(
             env,
             CLICK_ACTION,
-            data={"x": int(x), "y": int(y)},
+            data=data,
             reasoning={"phase": "probe", "kind": "centroid_click", "x": int(x), "y": int(y)},
         )
+        elapsed_ms = (time.monotonic() - started_at) * 1000
         transition = world.update(current, f"ACTION6({int(x)},{int(y)})", outcome.frame)
+        if on_transition is not None:
+            on_transition("probe", CLICK_ACTION, data, transition, outcome.frame, elapsed_ms)
         if transition.score_delta != 0 or transition.changed_cells != 0:
             report.action6_live_coords.append((int(x), int(y)))
         current = outcome.frame

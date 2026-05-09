@@ -28,6 +28,7 @@ from .explorer import (
     step_action,
     unwrap_step_result,
 )
+from .transition_log import TransitionLogger
 from .world_model import Transition, WorldModel, is_done, score_of
 
 log = logging.getLogger(__name__)
@@ -57,12 +58,15 @@ class CompetitionResult:
     scorecard_id: str
     runs: list[GameRunSummary] = field(default_factory=list)
     scorecard: Any = None
+    transitions_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "scorecard_id": self.scorecard_id,
             "runs": [run.to_dict() for run in self.runs],
         }
+        if self.transitions_path:
+            payload["transitions_path"] = self.transitions_path
         if self.scorecard is not None:
             payload["scorecard"] = _dump_model(self.scorecard)
         return payload
@@ -83,11 +87,13 @@ class OfflineControllerAgent:
         env: Any | None = None,
         scorecard_id: str | None = None,
         max_actions: int | None = None,
+        transition_logger: TransitionLogger | None = None,
     ) -> None:
         self.game_id = game_id
         self.env = env
         self.scorecard_id = scorecard_id
         self.max_actions = max_actions or self.MAX_ACTIONS
+        self.transition_logger = transition_logger
         self.world = WorldModel(game_id=game_id)
         self.probe_report = None
         self._action_cursor = 0
@@ -115,14 +121,18 @@ class OfflineControllerAgent:
                 initial_frame=current,
                 probe_budget=min(self.PROBE_BUDGET, self.max_actions),
                 max_probe_clicks=self.MAX_PROBE_CLICKS,
+                on_transition=self._log_transition,
             )
             self._action6_coords_cache = self._rank_action6_coords()
 
         while self.world.turn < self.max_actions and not is_done(current):
             action_name, data, reasoning = self._play_action(current)
             label = _action_label(action_name, data)
+            started_at = time.monotonic()
             outcome = step_action(env, action_name, data=data, reasoning=reasoning)
+            elapsed_ms = (time.monotonic() - started_at) * 1000
             transition = self.world.update(current, label, outcome.frame)
+            self._log_transition("play", action_name, data, transition, outcome.frame, elapsed_ms)
             self._update_progress(transition)
             current = outcome.frame
             log.info(
@@ -145,6 +155,27 @@ class OfflineControllerAgent:
             elapsed_seconds=time.monotonic() - started_at,
             probe_actions=self.probe_report and len(self.probe_report.directional_transitions) or 0,
             scorecard_id=self.scorecard_id,
+        )
+
+    def _log_transition(
+        self,
+        phase: str,
+        action: str,
+        data: dict[str, Any] | None,
+        transition: Transition,
+        next_frame: Any,
+        elapsed_ms: float,
+    ) -> None:
+        if self.transition_logger is None:
+            return
+        self.transition_logger.log(
+            game_id=self.game_id,
+            phase=phase,
+            action=action,
+            data=data,
+            transition=transition,
+            next_frame=next_frame,
+            elapsed_ms=elapsed_ms,
         )
 
     def _update_progress(self, transition: Transition) -> None:
@@ -277,14 +308,31 @@ def make_env(
 
 
 def list_game_ids(arc: Any) -> list[str]:
-    try:
-        envs = arc.get_environments()
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Could not list ARC environments: {exc}") from exc
+    envs = None
+    for attr in ("get_environments", "list_games", "games", "available_games"):
+        value = getattr(arc, attr, None)
+        try:
+            envs = value() if callable(value) else value
+        except Exception:  # noqa: BLE001
+            continue
+        if envs:
+            break
+    if not envs:
+        raise RuntimeError("Could not list ARC environments from Arcade.")
 
     ids: list[str] = []
     for env_info in envs:
-        game_id = getattr(env_info, "game_id", None) or getattr(env_info, "id", None)
+        if isinstance(env_info, str):
+            ids.append(env_info)
+            continue
+        if isinstance(env_info, dict):
+            game_id = env_info.get("game_id") or env_info.get("id") or env_info.get("name")
+        else:
+            game_id = (
+                getattr(env_info, "game_id", None)
+                or getattr(env_info, "id", None)
+                or getattr(env_info, "name", None)
+            )
         if game_id:
             ids.append(str(game_id))
     return ids
@@ -302,6 +350,7 @@ def run_competition(
     record: bool = False,
     max_actions: int | None = None,
     scorecard_id: str | None = None,
+    transitions_out: str | None = None,
 ) -> CompetitionResult:
     arc = create_arcade(api_key=api_key or os.getenv("ARC_API_KEY"), arc_base_url=arc_base_url)
     if game_ids is None:
@@ -313,7 +362,18 @@ def run_competition(
     if scorecard_id is None:
         scorecard_id = arc.create_scorecard(source_url=source_url, tags=tags, opaque=opaque)
 
-    result = CompetitionResult(scorecard_id=str(scorecard_id))
+    transition_logger: TransitionLogger | None = None
+    transitions_path = transitions_out
+    if transitions_path is None:
+        transitions_path = "runs/transitions-{scorecard_id}.jsonl"
+    if transitions_path:
+        transitions_path = transitions_path.format(
+            scorecard_id=str(scorecard_id),
+            card_id=str(scorecard_id),
+        )
+        transition_logger = TransitionLogger(transitions_path)
+
+    result = CompetitionResult(scorecard_id=str(scorecard_id), transitions_path=transitions_path)
     try:
         for game_id in game_ids:
             env = make_env(
@@ -328,6 +388,7 @@ def run_competition(
                 env=env,
                 scorecard_id=str(scorecard_id),
                 max_actions=max_actions,
+                transition_logger=transition_logger,
             )
             try:
                 result.runs.append(controller.run())
@@ -335,6 +396,8 @@ def run_competition(
                 log.exception("game %s failed: %s", game_id, exc)
                 result.runs.append(GameRunSummary(game_id=game_id, score=0, actions=0, error=str(exc)))
     finally:
+        if transition_logger is not None:
+            transition_logger.close()
         try:
             result.scorecard = arc.close_scorecard(str(scorecard_id))
         except Exception as exc:  # noqa: BLE001
@@ -384,6 +447,11 @@ def _cli() -> None:
     parser.add_argument("--source-url", default=None)
     parser.add_argument("--scorecard-id", default=None, help="existing Toolkit scorecard id; normally omit")
     parser.add_argument(
+        "--transitions-out",
+        default=None,
+        help="write transition JSONL here; supports {scorecard_id}",
+    )
+    parser.add_argument(
         "--arc-base-url",
         "--root-url",
         dest="arc_base_url",
@@ -412,6 +480,7 @@ def _cli() -> None:
         record=args.record,
         max_actions=args.max_actions,
         scorecard_id=args.scorecard_id,
+        transitions_out=args.transitions_out,
     )
 
     payload = result.to_dict()

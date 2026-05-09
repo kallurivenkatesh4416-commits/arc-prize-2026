@@ -8,6 +8,9 @@ __pycache__/
 .DS_Store
 scorecard.json
 *.recording.jsonl
+recordings/
 runs/*
 !runs/
 !runs/scorecard-*.closed.json
+!runs/transitions-*.jsonl
+!runs/ls20-*.json

@@ -5,6 +5,8 @@ Run: python -m tests.test_offline_smoke
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,10 +92,29 @@ class FakeEnv:
 
 def main() -> int:
     from agent.offline_controller import OfflineControllerAgent
+    from agent.transition_log import TransitionLogger
 
     env = FakeEnv()
-    agent = OfflineControllerAgent(game_id="smoke", env=env, scorecard_id="test-card", max_actions=16)
-    result = agent.run()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        transitions_path = Path(tmpdir) / "transitions-test-card.jsonl"
+        logger = TransitionLogger(transitions_path)
+        try:
+            agent = OfflineControllerAgent(
+                game_id="smoke",
+                env=env,
+                scorecard_id="test-card",
+                max_actions=16,
+                transition_logger=logger,
+            )
+            result = agent.run()
+        finally:
+            logger.close()
+
+        records = [
+            json.loads(line)
+            for line in transitions_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     failures: list[str] = []
     non_reset = [a for a in env.actions if a != "RESET"]
@@ -104,10 +125,29 @@ def main() -> int:
         failures.append("play phase did not replay productive ACTION1")
     if result.score < 3 or not result.won:
         failures.append(f"expected fake env win with score >=3, got score={result.score} won={result.won}")
+    if not records:
+        failures.append("transition log was empty")
+    else:
+        required = {
+            "turn",
+            "phase",
+            "action",
+            "state",
+            "score",
+            "score_delta",
+            "changed_cells",
+            "levels_completed",
+            "available_actions",
+            "elapsed_ms",
+        }
+        missing = required - set(records[0])
+        if missing:
+            failures.append(f"transition record missing keys: {sorted(missing)}")
 
     print(f"actions        = {env.actions}")
     print(f"distinct_probe = {sorted(distinct_probe)}")
     print(f"result         = {result.to_dict()}")
+    print(f"transition_n   = {len(records)}")
 
     if failures:
         print("FAIL:")

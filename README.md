@@ -34,6 +34,8 @@ cp .env.example .env     # fill in ARC_API_KEY (and OPENAI_API_KEY for the resea
 & .venv\Scripts\python.exe -m agent.offline_controller --game ls20 --record --out runs\ls20.json
 ```
 
+The controller writes transition JSONL evidence to `runs/transitions-<scorecard_id>.jsonl` by default.
+
 For the real API smoke from PowerShell:
 
 ```powershell
