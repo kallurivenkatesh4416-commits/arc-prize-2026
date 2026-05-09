@@ -1,22 +1,18 @@
-"""Pure helpers for probing ARC-AGI-3 grids.
-
-The previous version of this module drove ``env.step()`` / ``env.reset()``
-against a fictional SDK shape. The real ``arc_agi_3`` SDK owns the loop
-(see ``OfflineControllerAgent`` in ``offline_controller.py``), so the
-env-driving helpers have been removed. What remains here are the pure data
-helpers that the agent uses internally during its probe phase:
-
-- ``ProbeReport`` — dataclass summarising what was observed.
-- ``detect_objects`` — connected-component extraction from a 2D grid.
-- ``_centroid`` — bounding-box centroid for an :class:`ObjectTrace`.
-- ``DIRECTIONAL`` / ``CLICK_ACTION`` / ``RESET_ACTION`` / ``UNDO_ACTION``
-  constants used by the agent's policy.
-"""
+"""Helpers for probing ARC-AGI-3 toolkit environments."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
-from .world_model import ObjectTrace, Transition
+from .world_model import (
+    ObjectTrace,
+    Transition,
+    WorldModel,
+    available_actions,
+    grid_of,
+    is_done,
+    score_of,
+)
 
 DIRECTIONAL = ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"]
 CLICK_ACTION = "ACTION6"
@@ -50,6 +46,165 @@ class ProbeReport:
             for obj in self.objects[:8]:
                 lines.append(f"    color={obj.color} cells={obj.cell_count} bbox={obj.bbox}")
         return "\n".join(lines)
+
+
+@dataclass
+class StepOutcome:
+    frame: Any
+    reward: float | None = None
+    done: bool = False
+    info: Any = None
+
+
+def normalize_action_names(actions: Any) -> list[str]:
+    if not actions:
+        return []
+    names: list[str] = []
+    for action in actions:
+        name = getattr(action, "name", None)
+        if name:
+            names.append(str(name).upper())
+            continue
+        try:
+            action_id = int(action)
+        except (TypeError, ValueError):
+            names.append(str(action).split(".")[-1].upper())
+        else:
+            names.append("RESET" if action_id == 0 else f"ACTION{action_id}")
+    return names
+
+
+def legal_actions(env: Any, frame: Any | None = None) -> list[str]:
+    frame_actions = available_actions(frame) if frame is not None else []
+    if frame_actions:
+        return frame_actions
+    return normalize_action_names(getattr(env, "action_space", None))
+
+
+def unwrap_step_result(result: Any) -> StepOutcome:
+    if isinstance(result, tuple):
+        frame = result[0] if result else None
+        reward = result[1] if len(result) > 1 else None
+        if len(result) > 4:
+            done = bool(result[2]) or bool(result[3])
+            info = result[4]
+        else:
+            done = bool(result[2]) if len(result) > 2 else is_done(frame)
+            info = result[3] if len(result) > 3 else None
+        return StepOutcome(frame=frame, reward=reward, done=done, info=info)
+    return StepOutcome(frame=result, done=is_done(result))
+
+
+def step_action(
+    env: Any,
+    action_name: str,
+    data: dict[str, Any] | None = None,
+    reasoning: Any = None,
+) -> StepOutcome:
+    """Submit an action to an ``arc_agi`` EnvironmentWrapper.
+
+    The 0.9.x toolkit accepts ``step(GameAction, data=..., reasoning=...)``.
+    The fallbacks keep tests and slightly older builds easy to exercise.
+    """
+    from arcengine import GameAction  # type: ignore
+
+    action = getattr(GameAction, action_name)
+    kwargs: dict[str, Any] = {}
+    if data:
+        kwargs["data"] = data
+    if reasoning is not None:
+        kwargs["reasoning"] = reasoning
+
+    try:
+        return unwrap_step_result(env.step(action, **kwargs))
+    except TypeError:
+        pass
+
+    if data:
+        try:
+            return unwrap_step_result(env.step(action, data))
+        except TypeError:
+            if {"x", "y"} <= set(data):
+                return unwrap_step_result(env.step(action, int(data["x"]), int(data["y"])))
+            raise
+    return unwrap_step_result(env.step(action))
+
+
+def run_probe(
+    env: Any,
+    game_id: str,
+    *,
+    world: WorldModel | None = None,
+    initial_frame: Any | None = None,
+    probe_budget: int = 24,
+    max_probe_clicks: int = 8,
+) -> tuple[WorldModel, ProbeReport, Any]:
+    """Run a short scripted probe and return the updated world model."""
+    world = world or WorldModel(game_id=game_id)
+    if not world.game_id:
+        world.game_id = game_id
+
+    current = initial_frame
+    if current is None:
+        current = unwrap_step_result(env.reset()).frame
+
+    report = ProbeReport(
+        game_id=game_id,
+        legal_actions=legal_actions(env, current),
+        initial_score=score_of(current),
+    )
+
+    steps = 0
+    for action_name in DIRECTIONAL:
+        legal = legal_actions(env, current)
+        if legal and action_name not in legal:
+            continue
+        outcome = step_action(
+            env,
+            action_name,
+            reasoning={"phase": "probe", "kind": "directional", "action": action_name},
+        )
+        transition = world.update(current, action_name, outcome.frame)
+        report.directional_transitions.append(transition)
+        current = outcome.frame
+        steps += 1
+        if steps >= probe_budget or outcome.done or is_done(current):
+            return world, report, current
+
+    objects = detect_objects(grid_of(current))
+    report.objects = objects
+    world.record_objects(objects)
+
+    seen: set[tuple[int, int]] = set()
+    coords: list[tuple[int, int]] = []
+    for obj in objects:
+        coord = _centroid(obj)
+        if coord in seen:
+            continue
+        seen.add(coord)
+        coords.append(coord)
+        if len(coords) >= max_probe_clicks:
+            break
+
+    for x, y in coords:
+        legal = legal_actions(env, current)
+        if legal and CLICK_ACTION not in legal:
+            break
+        outcome = step_action(
+            env,
+            CLICK_ACTION,
+            data={"x": int(x), "y": int(y)},
+            reasoning={"phase": "probe", "kind": "centroid_click", "x": int(x), "y": int(y)},
+        )
+        transition = world.update(current, f"ACTION6({int(x)},{int(y)})", outcome.frame)
+        if transition.score_delta != 0 or transition.changed_cells != 0:
+            report.action6_live_coords.append((int(x), int(y)))
+        current = outcome.frame
+        steps += 1
+        if steps >= probe_budget or outcome.done or is_done(current):
+            break
+
+    return world, report, current
 
 
 def detect_objects(grid: list[list[int]] | None, background: int = 0) -> list[ObjectTrace]:

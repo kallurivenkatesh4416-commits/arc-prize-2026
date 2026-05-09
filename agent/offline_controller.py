@@ -1,25 +1,10 @@
-"""Offline ARC-AGI-3 controller as an ``arc_agi_3.Agent`` subclass.
+"""Offline ARC-AGI-3 controller using the current ``arc_agi`` Toolkit.
 
-The SDK owns the game loop (it calls ``choose_action`` per turn and handles
-HTTP transport via ``do_action_request``). This file implements a probe-then-
-policy controller that:
-
-1. Returns ``RESET`` when the game is in ``NOT_PLAYED`` / ``GAME_OVER``.
-2. Spends a small budget cycling directional actions and clicking object
-   centroids while recording what changes (``PROBE`` phase).
-3. Switches to a score-delta policy that prefers actions / ACTION6 coords
-   that produced score deltas or cell changes during the probe (``PLAY`` phase).
-
-The ACTION6 no-op filter from commit ``b9b4bd2`` is preserved: clicks whose
-probe transition produced ``score_delta == 0 and changed_cells == 0`` are
-NOT replayed during play.
-
-NOTE on Kaggle's "no internet" rule: this agent uses the SDK's
-``do_action_request`` HTTP calls against the ARC-AGI-3 evaluation API. ARC's
-own API endpoint should be permitted under Kaggle's evaluation policy, but
-external LLM APIs (OpenAI/Anthropic/etc.) are not — this controller is fully
-offline w.r.t. external models. Verify against the latest Kaggle evaluation
-runtime details before relying on this assumption for the final submission.
+The important lifecycle rule is that one ``arc_agi.Arcade`` instance should
+own scorecard creation, environment creation, action submission, and scorecard
+closing. The Toolkit keeps the HTTP session, cookies, and game guid threaded
+through its ``EnvironmentWrapper``; splitting scorecard open/close into a
+separate process can produce unscored runs.
 """
 from __future__ import annotations
 
@@ -29,205 +14,155 @@ import logging
 import os
 import random
 import re
+import time
+from dataclasses import dataclass, field
 from typing import Any
-
-import arc_agi_3
-from arc_agi_3 import GameAction, GameState
 
 from .explorer import (
     CLICK_ACTION,
     DIRECTIONAL,
     RESET_ACTION,
     UNDO_ACTION,
-    _centroid,
-    detect_objects,
+    legal_actions,
+    run_probe,
+    step_action,
+    unwrap_step_result,
 )
-from .world_model import (
-    Transition,
-    WorldModel,
-    grid_of,
-    score_of,
-)
+from .world_model import Transition, WorldModel, is_done, score_of
 
 log = logging.getLogger(__name__)
 
 ACTION6_LABEL = re.compile(r"ACTION6\((\d+),(\d+)\)")
-_PROBE_DIRECTIONALS = [
-    GameAction.ACTION1,
-    GameAction.ACTION2,
-    GameAction.ACTION3,
-    GameAction.ACTION4,
-    GameAction.ACTION5,
-]
 
 
-class OfflineControllerAgent(arc_agi_3.Agent):
-    """Probe-then-policy agent for ARC-AGI-3.
+@dataclass
+class GameRunSummary:
+    game_id: str
+    score: float
+    actions: int
+    levels_completed: int = 0
+    state: str = ""
+    won: bool = False
+    elapsed_seconds: float = 0.0
+    probe_actions: int = 0
+    scorecard_id: str | None = None
+    error: str | None = None
 
-    State machine inside :py:meth:`choose_action`:
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
 
-    - ``RESET_PENDING`` → returns ``GameAction.RESET`` whenever the game is
-      ``NOT_PLAYED`` / ``GAME_OVER``; flips into ``PROBE`` on the first
-      such reset.
-    - ``PROBE`` → for the first ``PROBE_BUDGET`` productive turns, cycle
-      directionals then click object centroids, recording transitions in
-      :class:`WorldModel`.
-    - ``PLAY`` → score-delta-driven policy: rank candidate non-click
-      actions, replay productive ACTION6 coordinates, fall back to
-      exploration when stuck.
-    """
 
-    MAX_ACTIONS = 240        # play-phase budget; SDK enforces this
-    PROBE_BUDGET = 24        # turns spent probing before play
-    NO_PROGRESS_CLICK_THRESHOLD = 1
+@dataclass
+class CompetitionResult:
+    scorecard_id: str
+    runs: list[GameRunSummary] = field(default_factory=list)
+    scorecard: Any = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "scorecard_id": self.scorecard_id,
+            "runs": [run.to_dict() for run in self.runs],
+        }
+        if self.scorecard is not None:
+            payload["scorecard"] = _dump_model(self.scorecard)
+        return payload
+
+
+class OfflineControllerAgent:
+    """Probe-then-policy controller for an ``arc_agi`` EnvironmentWrapper."""
+
+    MAX_ACTIONS = 240
+    PROBE_BUDGET = 24
     MAX_PROBE_CLICKS = 8
+    NO_PROGRESS_CLICK_THRESHOLD = 5
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.world = WorldModel(game_id=self.game_id)
-        self._phase = "RESET_PENDING"
-        self._probe_steps = 0
-        self._probe_dir_idx = 0
-        self._probe_click_idx = 0
-        self._probe_click_coords: list[tuple[int, int]] = []
+    def __init__(
+        self,
+        *,
+        game_id: str,
+        env: Any | None = None,
+        scorecard_id: str | None = None,
+        max_actions: int | None = None,
+    ) -> None:
+        self.game_id = game_id
+        self.env = env
+        self.scorecard_id = scorecard_id
+        self.max_actions = max_actions or self.MAX_ACTIONS
+        self.world = WorldModel(game_id=game_id)
+        self.probe_report = None
         self._action_cursor = 0
         self._click_cursor = 0
         self._no_progress_turns = 0
-        self._last_grid: list[list[int]] | None = None
-        self._last_score = 0
-        # Cache of productive ACTION6 coords discovered during probing,
-        # populated lazily on the first PLAY turn.
         self._action6_coords_cache: list[tuple[int, int]] | None = None
 
-    # ------------------------------------------------------------------
-    # Agent contract
-    # ------------------------------------------------------------------
+    def run(self, env: Any | None = None) -> GameRunSummary:
+        env = env or self.env
+        if env is None:
+            raise ValueError("OfflineControllerAgent.run requires an EnvironmentWrapper.")
+        self.env = env
 
-    def is_done(self, frames: list[Any], latest_frame: Any) -> bool:
-        return latest_frame.state is GameState.WIN
+        started_at = time.monotonic()
+        initial_frame = unwrap_step_result(env.reset()).frame
+        self.world.frame_history.append(initial_frame)
+        self.world.current_score = score_of(initial_frame)
 
-    def choose_action(self, frames: list[Any], latest_frame: Any) -> GameAction:
-        # 1. RESET handling — must come before any world-model update because
-        #    the previous frame (if any) may belong to a finished game.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            if self._phase == "RESET_PENDING":
-                self._phase = "PROBE"
-            return self._reasoned(GameAction.RESET, "reset before play")
-
-        # 2. Update world model from prev → latest using the previous frame
-        #    in ``frames`` (the SDK appends the latest frame to ``frames``).
-        #
-        #    NOTE: ``prev.action_input.id`` is the SDK ``GameAction`` enum.
-        #    Keep this controller on that enum end-to-end so Agent.take_action
-        #    sees the exact type it expects, especially for RESET card_id setup.
-        if frames and len(frames) >= 2:
-            prev = frames[-2]
-            try:
-                last_action_id = prev.action_input.id
-                last_action_data = prev.action_input.data or {}
-            except AttributeError:
-                last_action_id = None
-                last_action_data = {}
-            if last_action_id is not None and getattr(last_action_id, "name", "") != "RESET":
-                label = self._action_label(last_action_id, last_action_data)
-                self.world.update(prev, label, latest_frame)
-
-        self._last_grid = grid_of(latest_frame)
-        self._last_score = latest_frame.score
-
-        # 3. Phase: PROBE → cycle directionals, then click object centroids.
-        if self._phase == "PROBE" and self._probe_steps < self.PROBE_BUDGET:
-            self._probe_steps += 1
-            return self._next_probe_action(latest_frame)
-
-        # 4. Phase: PLAY → score-delta policy + ACTION6 replay.
-        if self._phase != "PLAY":
-            self._phase = "PLAY"
+        current = initial_frame
+        if not is_done(current) and self.max_actions > 0:
+            self.world, self.probe_report, current = run_probe(
+                env,
+                self.game_id,
+                world=self.world,
+                initial_frame=current,
+                probe_budget=min(self.PROBE_BUDGET, self.max_actions),
+                max_probe_clicks=self.MAX_PROBE_CLICKS,
+            )
             self._action6_coords_cache = self._rank_action6_coords()
-        return self._play_action(latest_frame)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        while self.world.turn < self.max_actions and not is_done(current):
+            action_name, data, reasoning = self._play_action(current)
+            label = _action_label(action_name, data)
+            outcome = step_action(env, action_name, data=data, reasoning=reasoning)
+            transition = self.world.update(current, label, outcome.frame)
+            self._update_progress(transition)
+            current = outcome.frame
+            log.info(
+                "%s - %s: count %s, score %s",
+                self.game_id,
+                label,
+                self.world.turn,
+                score_of(current),
+            )
+            if outcome.done:
+                break
 
-    def _reasoned(self, action: GameAction, reason: str) -> GameAction:
-        if action.is_simple():
-            action.reasoning = reason
-        return action
+        return GameRunSummary(
+            game_id=self.game_id,
+            score=score_of(current),
+            actions=self.world.turn,
+            levels_completed=_int_attr(current, "levels_completed"),
+            state=_state_name(getattr(current, "state", "")),
+            won=_state_name(getattr(current, "state", "")) == "WIN",
+            elapsed_seconds=time.monotonic() - started_at,
+            probe_actions=self.probe_report and len(self.probe_report.directional_transitions) or 0,
+            scorecard_id=self.scorecard_id,
+        )
 
-    def _action_label(self, action_id: Any, data: dict[str, Any]) -> str:
-        name = getattr(action_id, "name", str(action_id))
-        if name == "ACTION6" and isinstance(data, dict):
-            return f"ACTION6({data.get('x')},{data.get('y')})"
-        return name
+    def _update_progress(self, transition: Transition) -> None:
+        if transition.score_delta > 0 or transition.changed_cells > 0:
+            self._no_progress_turns = 0
+        else:
+            self._no_progress_turns += 1
 
-    def _legal_action_names(self, latest_frame: Any) -> list[str]:
-        avail = getattr(latest_frame, "available_actions", None) or []
-        return [a.name for a in avail]
-
-    # ----- PROBE phase -------------------------------------------------
-
-    def _next_probe_action(self, latest_frame: Any) -> GameAction:
-        """Cycle directionals, then click up to ``MAX_PROBE_CLICKS`` centroids.
-
-        We deliberately probe on the *current* frame's state so we don't
-        burn turns on actions that aren't legal right now.
-        """
-        legal = set(self._legal_action_names(latest_frame))
-
-        # Phase 3a: directionals — try each legal directional once.
-        while self._probe_dir_idx < len(_PROBE_DIRECTIONALS):
-            candidate = _PROBE_DIRECTIONALS[self._probe_dir_idx]
-            self._probe_dir_idx += 1
-            if not legal or candidate.name in legal:
-                return self._reasoned(candidate, f"probe directional {candidate.name}")
-
-        # Phase 3b: ACTION6 centroids — populate coord queue lazily.
-        if not self._probe_click_coords:
-            grid = grid_of(latest_frame)
-            objects = detect_objects(grid)
-            seen: set[tuple[int, int]] = set()
-            for obj in objects:
-                coord = _centroid(obj)
-                if coord in seen:
-                    continue
-                seen.add(coord)
-                self._probe_click_coords.append(coord)
-                if len(self._probe_click_coords) >= self.MAX_PROBE_CLICKS:
-                    break
-
-        if (
-            (not legal or CLICK_ACTION in legal)
-            and self._probe_click_idx < len(self._probe_click_coords)
-        ):
-            x, y = self._probe_click_coords[self._probe_click_idx]
-            self._probe_click_idx += 1
-            action = GameAction.ACTION6
-            action.set_data({"x": int(x), "y": int(y)})
-            action.reasoning = {
-                "phase": "probe",
-                "kind": "centroid_click",
-                "x": int(x),
-                "y": int(y),
-            }
-            return action
-
-        # Probe queue exhausted earlier than budget — flip to play.
-        self._phase = "PLAY"
-        self._action6_coords_cache = self._rank_action6_coords()
-        return self._play_action(latest_frame)
-
-    # ----- PLAY phase --------------------------------------------------
-
-    def _transition_rank(self, t: Transition) -> tuple[int, int]:
+    def _transition_rank(self, t: Transition) -> tuple[float, int]:
         return (t.score_delta, t.changed_cells)
 
     def _rank_non_click_actions(self, legal: list[str]) -> list[str]:
+        legal_set = set(legal)
         candidates: list[tuple[float, float, str]] = []
         for action_name, transitions in self.world.action_effects.items():
             if action_name == CLICK_ACTION or action_name in (RESET_ACTION, UNDO_ACTION):
                 continue
-            if legal and action_name not in legal:
+            if legal_set and action_name not in legal_set:
                 continue
             if not transitions:
                 continue
@@ -238,13 +173,7 @@ class OfflineControllerAgent(arc_agi_3.Agent):
         return [name for _, _, name in candidates]
 
     def _rank_action6_coords(self) -> list[tuple[int, int]]:
-        """Productive ACTION6 coords ranked by (score_delta, changed_cells).
-
-        Preserves the no-op filter from commit b9b4bd2: coords whose probe
-        transition produced ``score_delta == 0 and changed_cells == 0`` are
-        skipped entirely.
-        """
-        by_coord: dict[tuple[int, int], tuple[int, int]] = {}
+        by_coord: dict[tuple[int, int], tuple[float, int]] = {}
         for t in self.world.action_effects.get(CLICK_ACTION, []):
             if t.score_delta == 0 and t.changed_cells == 0:
                 continue
@@ -258,117 +187,234 @@ class OfflineControllerAgent(arc_agi_3.Agent):
         ranked = sorted(by_coord.items(), key=lambda item: item[1], reverse=True)
         return [coord for coord, _ in ranked]
 
-    def _play_action(self, latest_frame: Any) -> GameAction:
-        legal_names = self._legal_action_names(latest_frame)
-        legal_set = set(legal_names) if legal_names else set(DIRECTIONAL + [CLICK_ACTION])
-
+    def _play_action(self, latest_frame: Any) -> tuple[str, dict[str, Any] | None, Any]:
+        legal = legal_actions(self.env, latest_frame) or list(DIRECTIONAL)
+        legal_set = set(legal)
         coords = self._action6_coords_cache or []
 
-        # Update no-progress counter from the most recent transition.
-        last_transitions = self._last_transition()
-        if last_transitions is not None:
-            if last_transitions.score_delta > 0 or last_transitions.changed_cells > 0:
-                self._no_progress_turns = 0
-            else:
-                self._no_progress_turns += 1
-
-        # Prefer replaying productive ACTION6 coords either right away or
-        # whenever we've stalled.
         if (
             CLICK_ACTION in legal_set
             and coords
-            and (self._no_progress_turns >= self.NO_PROGRESS_CLICK_THRESHOLD or self._click_cursor == 0)
+            and self._no_progress_turns >= self.NO_PROGRESS_CLICK_THRESHOLD
         ):
             x, y = coords[self._click_cursor % len(coords)]
             self._click_cursor += 1
-            action = GameAction.ACTION6
-            action.set_data({"x": int(x), "y": int(y)})
-            action.reasoning = {
-                "phase": "play",
-                "kind": "replay_productive_click",
-                "x": int(x),
-                "y": int(y),
-            }
-            return action
+            return (
+                CLICK_ACTION,
+                {"x": int(x), "y": int(y)},
+                {"phase": "play", "kind": "replay_productive_click", "x": int(x), "y": int(y)},
+            )
 
-        ranked_actions = self._rank_non_click_actions(list(legal_set))
+        ranked_actions = self._rank_non_click_actions(legal)
         exploratory = [a for a in DIRECTIONAL if a in legal_set and a not in ranked_actions]
         candidates = ranked_actions + exploratory
 
         if candidates:
             name = candidates[self._action_cursor % len(candidates)]
             self._action_cursor += 1
-            action = getattr(GameAction, name)
-            return self._reasoned(action, f"play: ranked candidate {name}")
+            return name, None, {"phase": "play", "kind": "ranked_candidate", "action": name}
 
         if CLICK_ACTION in legal_set and coords:
             x, y = coords[self._click_cursor % len(coords)]
             self._click_cursor += 1
-            action = GameAction.ACTION6
-            action.set_data({"x": int(x), "y": int(y)})
-            action.reasoning = {"phase": "play", "kind": "fallback_click"}
-            return action
+            return CLICK_ACTION, {"x": int(x), "y": int(y)}, {"phase": "play", "kind": "fallback_click"}
 
-        # Last resort — random legal action.
-        fallback_name = random.choice(list(legal_set) or DIRECTIONAL)
-        action = getattr(GameAction, fallback_name)
-        if action.is_simple():
-            action.reasoning = "play: random fallback"
-        elif action.is_complex():
-            action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
-            action.reasoning = {"phase": "play", "kind": "random_fallback"}
-        return action
-
-    def _last_transition(self) -> Transition | None:
-        for transitions in self.world.action_effects.values():
-            if transitions:
-                last = transitions[-1]
-                if last.turn == self.world.turn - 1:
-                    return last
-        return None
+        fallback = random.choice(legal or DIRECTIONAL)
+        if fallback == CLICK_ACTION:
+            data = {"x": random.randint(0, 63), "y": random.randint(0, 63)}
+            return fallback, data, {"phase": "play", "kind": "random_fallback"}
+        return fallback, None, {"phase": "play", "kind": "random_fallback"}
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
+def create_arcade(*, api_key: str | None = None, arc_base_url: str | None = None) -> Any:
+    import arc_agi  # type: ignore
+
+    kwargs: dict[str, Any] = {}
+    if api_key:
+        kwargs["arc_api_key"] = api_key
+    if arc_base_url:
+        kwargs["arc_base_url"] = arc_base_url
+    try:
+        from arc_agi import OperationMode  # type: ignore
+
+        kwargs["operation_mode"] = OperationMode.ONLINE
+    except Exception:  # noqa: BLE001
+        pass
+    return arc_agi.Arcade(**kwargs)
+
+
+def make_env(
+    arc: Any,
+    *,
+    game_id: str,
+    scorecard_id: str,
+    seed: int = 0,
+    record: bool = False,
+    include_frame_data: bool = True,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "seed": seed,
+        "scorecard_id": scorecard_id,
+        "save_recording": record,
+        "include_frame_data": include_frame_data,
+    }
+    while True:
+        try:
+            env = arc.make(game_id, **kwargs)
+            if env is None:
+                raise RuntimeError(f"arc.make({game_id!r}) returned None")
+            return env
+        except TypeError as exc:
+            message = str(exc)
+            removed = False
+            for key in ("include_frame_data", "save_recording", "seed"):
+                if key in kwargs and key in message:
+                    kwargs.pop(key)
+                    removed = True
+                    break
+            if not removed:
+                raise
+
+
+def list_game_ids(arc: Any) -> list[str]:
+    try:
+        envs = arc.get_environments()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Could not list ARC environments: {exc}") from exc
+
+    ids: list[str] = []
+    for env_info in envs:
+        game_id = getattr(env_info, "game_id", None) or getattr(env_info, "id", None)
+        if game_id:
+            ids.append(str(game_id))
+    return ids
+
+
+def run_competition(
+    game_ids: list[str] | None,
+    *,
+    api_key: str | None = None,
+    arc_base_url: str | None = None,
+    source_url: str | None = None,
+    tags: list[str] | None = None,
+    opaque: dict[str, Any] | None = None,
+    seed: int = 0,
+    record: bool = False,
+    max_actions: int | None = None,
+    scorecard_id: str | None = None,
+) -> CompetitionResult:
+    arc = create_arcade(api_key=api_key or os.getenv("ARC_API_KEY"), arc_base_url=arc_base_url)
+    if game_ids is None:
+        game_ids = list_game_ids(arc)
+    if not game_ids:
+        raise RuntimeError("No ARC games available for this API key.")
+
+    tags = tags or ["offline-controller", "probe-policy"]
+    if scorecard_id is None:
+        scorecard_id = arc.create_scorecard(source_url=source_url, tags=tags, opaque=opaque)
+
+    result = CompetitionResult(scorecard_id=str(scorecard_id))
+    try:
+        for game_id in game_ids:
+            env = make_env(
+                arc,
+                game_id=game_id,
+                scorecard_id=str(scorecard_id),
+                seed=seed,
+                record=record,
+            )
+            controller = OfflineControllerAgent(
+                game_id=game_id,
+                env=env,
+                scorecard_id=str(scorecard_id),
+                max_actions=max_actions,
+            )
+            try:
+                result.runs.append(controller.run())
+            except Exception as exc:  # noqa: BLE001
+                log.exception("game %s failed: %s", game_id, exc)
+                result.runs.append(GameRunSummary(game_id=game_id, score=0, actions=0, error=str(exc)))
+    finally:
+        try:
+            result.scorecard = arc.close_scorecard(str(scorecard_id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("close_scorecard(%s) failed: %s", scorecard_id, exc)
+            try:
+                result.scorecard = arc.get_scorecard(str(scorecard_id))
+            except Exception as get_exc:  # noqa: BLE001
+                log.warning("get_scorecard(%s) failed: %s", scorecard_id, get_exc)
+    return result
+
+
+def _action_label(action_name: str, data: dict[str, Any] | None) -> str:
+    if action_name == CLICK_ACTION and data:
+        return f"ACTION6({data.get('x')},{data.get('y')})"
+    return action_name
+
+
+def _dump_model(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
+
+
+def _int_attr(value: Any, name: str, default: int = 0) -> int:
+    try:
+        return int(getattr(value, name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _state_name(value: Any) -> str:
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    return str(value).split(".")[-1] if value is not None else ""
 
 
 def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Run the offline ARC-AGI-3 controller on one game.")
-    parser.add_argument("--game", required=True, help="game_id, e.g. ls20")
-    parser.add_argument("--card", required=True, help="card_id from the ARC-AGI-3 API")
-    parser.add_argument(
-        "--root-url",
-        default=os.environ.get("ARC_ROOT_URL", "https://three.arcprize.org"),
-        help="ARC-AGI-3 API root URL (verify against docs.arcprize.org/create-agent)",
-    )
-    parser.add_argument("--record", action="store_true", help="record frames for replay")
+    parser = argparse.ArgumentParser(description="Run the offline ARC-AGI-3 controller via arc_agi.Arcade.")
+    parser.add_argument("--game", action="append", required=True, help="game_id; repeat for multiple games")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-actions", type=int, default=OfflineControllerAgent.MAX_ACTIONS)
+    parser.add_argument("--record", action="store_true", help="ask the Toolkit to save a recording")
     parser.add_argument("--tags", nargs="*", default=None)
-    parser.add_argument("--out", default=None, help="write final scorecard JSON here")
+    parser.add_argument("--source-url", default=None)
+    parser.add_argument("--scorecard-id", default=None, help="existing Toolkit scorecard id; normally omit")
+    parser.add_argument(
+        "--arc-base-url",
+        "--root-url",
+        dest="arc_base_url",
+        default=os.environ.get("ARC_BASE_URL", "https://three.arcprize.org"),
+    )
+    parser.add_argument("--out", default=None, help="write result JSON here")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
-    agent = OfflineControllerAgent(
-        card_id=args.card,
-        game_id=args.game,
-        agent_name="offline-controller",
-        ROOT_URL=args.root_url,
-        record=args.record,
-        tags=args.tags,
-    )
-    agent.main()
-
-    payload: dict[str, Any] = {"game_id": args.game}
     try:
-        scorecard = agent.get_scorecard()  # type: ignore[attr-defined]
-        if hasattr(scorecard, "model_dump"):
-            payload["scorecard"] = scorecard.model_dump()
-        else:
-            payload["scorecard"] = scorecard
-    except Exception as exc:  # noqa: BLE001
-        log.warning("get_scorecard() failed: %s", exc)
+        from dotenv import load_dotenv  # type: ignore
 
+        load_dotenv()
+    except Exception:  # noqa: BLE001
+        pass
+
+    opaque = {"runner": "agent.offline_controller", "games": args.game}
+    result = run_competition(
+        args.game,
+        api_key=os.getenv("ARC_API_KEY"),
+        arc_base_url=args.arc_base_url,
+        source_url=args.source_url,
+        tags=args.tags,
+        opaque=opaque,
+        seed=args.seed,
+        record=args.record,
+        max_actions=args.max_actions,
+        scorecard_id=args.scorecard_id,
+    )
+
+    payload = result.to_dict()
     text = json.dumps(payload, indent=2, default=str)
     print(text)
     if args.out:

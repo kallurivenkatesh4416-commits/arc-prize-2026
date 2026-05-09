@@ -1,7 +1,13 @@
 .env
+arc_competition_api_key*
+.arc_competition_api_key
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .venv/
 .DS_Store
 scorecard.json
+*.recording.jsonl
+runs/*
+!runs/
+!runs/scorecard-*.closed.json

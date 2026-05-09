@@ -10,13 +10,20 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-# Optional SDK import — keep module importable on Python <3.12 / without arc-agi-3.
+# Optional SDK imports — keep module importable on Python <3.12 / without ARC SDKs.
 try:  # pragma: no cover - exercised only when the SDK is installed
     from arc_agi_3 import FrameData as _FrameData  # type: ignore
     from arc_agi_3 import GameState as _GameState  # type: ignore
 except Exception:  # noqa: BLE001
     _FrameData = None  # type: ignore[assignment]
     _GameState = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - exercised only when the toolkit is installed
+    from arcengine import FrameDataRaw as _FrameDataRaw  # type: ignore
+    from arcengine import GameState as _EngineGameState  # type: ignore
+except Exception:  # noqa: BLE001
+    _FrameDataRaw = None  # type: ignore[assignment]
+    _EngineGameState = None  # type: ignore[assignment]
 
 
 def _is_frame_data(frame: Any) -> bool:
@@ -27,6 +34,8 @@ def _is_frame_data(frame: Any) -> bool:
     is genuinely a FrameData, we route through the typed accessors.
     """
     if _FrameData is not None and isinstance(frame, _FrameData):
+        return True
+    if _FrameDataRaw is not None and isinstance(frame, _FrameDataRaw):
         return True
     return False
 
@@ -48,17 +57,28 @@ def grid_of(frame: Any) -> list[list[int]] | None:
     frames used by smoke tests.
     """
     if _is_frame_data(frame):
-        f = frame.frame
-        if not f:
-            return None
-        # 3D check: first row is itself a list of rows.
-        if isinstance(f[0], list) and f[0] and isinstance(f[0][0], list):
-            return f[0]
-        return f  # already 2D
-    grid = _get(frame, "grid", "frame", "observation", "state")
+        grid = frame.frame
+    else:
+        grid = _get(frame, "grid", "frame", "observation", "obs", "state")
     if grid is None:
         return None
-    # Some legacy frames may also wrap a 3D grid.
+    if isinstance(grid, tuple) and grid:
+        grid = grid[0]
+
+    try:
+        import numpy as np  # type: ignore
+
+        arr = np.asarray(grid)
+        while arr.ndim > 2:
+            arr = arr[0]
+        if arr.ndim == 2:
+            return arr.tolist()
+        return None
+    except Exception:  # noqa: BLE001
+        pass
+
+    if hasattr(grid, "tolist"):
+        grid = grid.tolist()
     if (
         isinstance(grid, list)
         and grid
@@ -67,15 +87,13 @@ def grid_of(frame: Any) -> list[list[int]] | None:
         and isinstance(grid[0][0], list)
     ):
         grid = grid[0]
-    if hasattr(grid, "tolist"):
-        grid = grid.tolist()
     return grid
 
 
 def score_of(frame: Any) -> int:
     if _is_frame_data(frame):
         try:
-            return int(frame.score)
+            return int(getattr(frame, "score", 0) or 0)
         except (TypeError, ValueError):
             return 0
     value = _get(frame, "score", default=0)
@@ -87,20 +105,44 @@ def score_of(frame: Any) -> int:
 
 def is_done(frame: Any) -> bool:
     if _is_frame_data(frame):
-        if _GameState is None:
-            return False
-        return frame.state in (_GameState.WIN, _GameState.GAME_OVER)
-    return bool(_get(frame, "done", "game_over", "terminal", "finished", default=False))
+        return _state_name(_get(frame, "state")) in {"WIN", "GAME_OVER", "NOT_STARTED"}
+    explicit = _get(frame, "done", "game_over", "terminal", "finished", default=None)
+    if explicit is not None:
+        return bool(explicit)
+    return _state_name(_get(frame, "state")) in {"WIN", "GAME_OVER", "NOT_STARTED"}
 
 
 def available_actions(frame: Any) -> list[str]:
     if _is_frame_data(frame):
         actions = frame.available_actions or []
-        return [a.name for a in actions]
+        return [_action_name(a) for a in actions]
     actions = _get(frame, "available_actions", "legal_actions", "actions")
     if not actions:
         return []
-    return [str(a).upper() for a in actions]
+    return [_action_name(a) for a in actions]
+
+
+def _state_name(value: Any) -> str:
+    if value is None:
+        return ""
+    name = getattr(value, "name", None)
+    if name:
+        return str(name).upper()
+    return str(value).split(".")[-1].upper()
+
+
+def _action_name(value: Any) -> str:
+    name = getattr(value, "name", None)
+    if name:
+        return str(name).upper()
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError):
+        text = str(value).split(".")[-1].upper()
+        return text
+    if as_int == 0:
+        return "RESET"
+    return f"ACTION{as_int}"
 
 
 def _count_changed_cells(prev: list[list[int]] | None, curr: list[list[int]] | None) -> int:
