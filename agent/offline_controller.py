@@ -95,6 +95,8 @@ def _rank_non_click_actions(world: WorldModel, legal: list[str]) -> list[str]:
 def _rank_action6_coords(world: WorldModel, report: ProbeReport) -> list[tuple[int, int]]:
     by_coord: dict[tuple[int, int], tuple[int, int]] = {}
     for t in world.action_effects.get(CLICK_ACTION, []):
+        if t.score_delta == 0 and t.changed_cells == 0:
+            continue
         match = ACTION6_LABEL.fullmatch(t.action)
         if not match:
             continue
