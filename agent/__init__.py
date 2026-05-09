@@ -7,6 +7,7 @@ from .explorer import (
     detect_objects,
 )
 from .llm_agent import run_competition
+from .offline_controller import run_competition_offline
 
 __all__ = [
     "WorldModel",
@@ -19,4 +20,5 @@ __all__ = [
     "sample_action6_on_objects",
     "detect_objects",
     "run_competition",
+    "run_competition_offline",
 ]
