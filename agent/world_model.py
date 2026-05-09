@@ -10,6 +10,26 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+# Optional SDK import — keep module importable on Python <3.12 / without arc-agi-3.
+try:  # pragma: no cover - exercised only when the SDK is installed
+    from arc_agi_3 import FrameData as _FrameData  # type: ignore
+    from arc_agi_3 import GameState as _GameState  # type: ignore
+except Exception:  # noqa: BLE001
+    _FrameData = None  # type: ignore[assignment]
+    _GameState = None  # type: ignore[assignment]
+
+
+def _is_frame_data(frame: Any) -> bool:
+    """True if ``frame`` looks like an ``arc_agi_3.FrameData`` instance.
+
+    We don't rely on isinstance against ``_FrameData`` exclusively because
+    smoke tests may pass dicts. But when the SDK is installed and the object
+    is genuinely a FrameData, we route through the typed accessors.
+    """
+    if _FrameData is not None and isinstance(frame, _FrameData):
+        return True
+    return False
+
 
 def _get(frame: Any, *keys: str, default: Any = None) -> Any:
     for key in keys:
@@ -21,15 +41,43 @@ def _get(frame: Any, *keys: str, default: Any = None) -> Any:
 
 
 def grid_of(frame: Any) -> list[list[int]] | None:
+    """Return a 2D grid (list of rows) extracted from a frame.
+
+    ``FrameData.frame`` is 3D (``list[list[list[int]]]``); the visible 2D grid
+    is the first slice. Falls back to dict-style access for legacy / mock
+    frames used by smoke tests.
+    """
+    if _is_frame_data(frame):
+        f = frame.frame
+        if not f:
+            return None
+        # 3D check: first row is itself a list of rows.
+        if isinstance(f[0], list) and f[0] and isinstance(f[0][0], list):
+            return f[0]
+        return f  # already 2D
     grid = _get(frame, "grid", "frame", "observation", "state")
     if grid is None:
         return None
+    # Some legacy frames may also wrap a 3D grid.
+    if (
+        isinstance(grid, list)
+        and grid
+        and isinstance(grid[0], list)
+        and grid[0]
+        and isinstance(grid[0][0], list)
+    ):
+        grid = grid[0]
     if hasattr(grid, "tolist"):
         grid = grid.tolist()
     return grid
 
 
 def score_of(frame: Any) -> int:
+    if _is_frame_data(frame):
+        try:
+            return int(frame.score)
+        except (TypeError, ValueError):
+            return 0
     value = _get(frame, "score", default=0)
     try:
         return int(value) if value is not None else 0
@@ -38,10 +86,17 @@ def score_of(frame: Any) -> int:
 
 
 def is_done(frame: Any) -> bool:
+    if _is_frame_data(frame):
+        if _GameState is None:
+            return False
+        return frame.state in (_GameState.WIN, _GameState.GAME_OVER)
     return bool(_get(frame, "done", "game_over", "terminal", "finished", default=False))
 
 
 def available_actions(frame: Any) -> list[str]:
+    if _is_frame_data(frame):
+        actions = frame.available_actions or []
+        return [a.name for a in actions]
     actions = _get(frame, "available_actions", "legal_actions", "actions")
     if not actions:
         return []
