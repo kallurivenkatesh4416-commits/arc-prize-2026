@@ -37,19 +37,11 @@ def _make_frame(
     `grid` is the 2D array; we wrap it in a 3D list-of-lists-of-lists as the
     real SDK does (`frame.frame[0]` is the active grid).
     """
-    from arc_agi_3 import FrameData, ActionInput, GameAction as SDKGameAction
-    from arcengine import GameAction  # noqa: F401  kept for callers' type readability
-
-    # FrameData/ActionInput fields use arc_agi_3.GameAction; the agent
-    # receives/returns arcengine.GameAction. Despite identical names+ints,
-    # they're distinct enum classes and value-lookup (SDKGameAction(1))
-    # raises ValueError. Name-lookup is the robust bridge.
-    def _to_sdk(a):
-        return SDKGameAction[a.name] if a is not None else None
+    from arc_agi_3 import FrameData, ActionInput
 
     action_input_kwargs: dict = {}
     if last_action is not None:
-        action_input_kwargs["id"] = _to_sdk(last_action)
+        action_input_kwargs["id"] = last_action
     if last_data is not None:
         action_input_kwargs["data"] = last_data
     action_input = ActionInput(**action_input_kwargs) if action_input_kwargs else ActionInput()
@@ -60,7 +52,7 @@ def _make_frame(
         state=state,
         score=score,
         action_input=action_input,
-        available_actions=[_to_sdk(a) for a in available],
+        available_actions=list(available),
     )
 
 
@@ -82,21 +74,15 @@ def _instantiate_agent():
 def main() -> int:
     # Graceful skip if the real SDK is unavailable.
     try:
-        from arc_agi_3 import GameState  # noqa: F401
-        from arcengine import GameAction  # noqa: F401
+        from arc_agi_3 import GameAction, GameState  # noqa: F401
     except Exception as exc:  # noqa: BLE001
-        print(f"SKIP: arc_agi_3 / arcengine unavailable ({exc!r}); "
+        print(f"SKIP: arc_agi_3 unavailable ({exc!r}); "
               "offline smoke needs Python >=3.12 with the real SDK installed.")
         return 0
 
-    try:
-        from arc_agi_3 import GameState
-        from arcengine import GameAction
-        agent = _instantiate_agent()
-    except Exception as exc:  # noqa: BLE001
-        print(f"SKIP: could not instantiate OfflineControllerAgent ({exc!r}); "
-              "module may still be in flux from a parallel rewrite.")
-        return 0
+    from arc_agi_3 import GameState
+    from arc_agi_3 import GameAction
+    agent = _instantiate_agent()
 
     failures: list[str] = []
     GRID_BLANK = [[0, 0, 0, 0] for _ in range(4)]

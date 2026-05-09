@@ -1,10 +1,10 @@
-"""Claude tool-use loop that plays ARC-AGI-3 games.
+"""Legacy Claude tool-use loop that targeted a pre-SDK ARC-AGI-3 shape.
 
-Per game:
-  1. scripted probe seeds the world model (cheap facts Claude shouldn't pay to rediscover)
-  2. Claude picks actions via tool use, informed by world_model.summary()
-  3. budget guardrails fall back to random-from-probe if Claude stalls
-  4. scorecard collected across all games and returned
+This module is parked for reference. The real ``arc_agi_3`` SDK owns the
+game loop through ``Agent.choose_action`` and HTTP action requests, so this
+env-driving harness is not the prize path. Use ``OfflineControllerAgent`` for
+the offline submission and the SDK's builtin ``Swarm(agent="llm", ...)`` for
+online research runs.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from .explorer import (
     DIRECTIONAL,
     RESET_ACTION,
     UNDO_ACTION,
-    run_probe,
 )
 from .world_model import (
     WorldModel,
@@ -34,6 +33,12 @@ from .world_model import (
 )
 
 log = logging.getLogger(__name__)
+
+LEGACY_DISABLED_MESSAGE = (
+    "agent.llm_agent is parked legacy code from the pre-arc_agi_3 SDK "
+    "env.step() architecture. Use arc_agi_3.Swarm(agent='llm', ...) for "
+    "online research runs, or port this module to Agent.choose_action first."
+)
 
 CLAUDE_MODEL = "claude-opus-4-7"
 DEFAULT_PER_GAME_WALL_SECONDS = 240
@@ -273,6 +278,7 @@ def play_game(
     model: str = CLAUDE_MODEL,
     transcript_path: str | None = None,
 ) -> GameResult:
+    raise RuntimeError(LEGACY_DISABLED_MESSAGE)
     env = arc.make(game_id)
 
     transcript_fp = None
@@ -444,6 +450,7 @@ def run_competition(
     model: str = CLAUDE_MODEL,
     transcript_dir: str | None = None,
 ) -> Scorecard:
+    raise RuntimeError(LEGACY_DISABLED_MESSAGE)
     import arc_agi  # type: ignore
 
     arc = arc_agi.Arcade()
@@ -481,6 +488,7 @@ def run_competition(
 
 
 def _cli() -> None:
+    raise RuntimeError(LEGACY_DISABLED_MESSAGE)
     parser = argparse.ArgumentParser()
     parser.add_argument("--game", action="append", help="game_id; pass multiple times for multiple games")
     parser.add_argument("--budget", type=int, default=DEFAULT_PER_GAME_WALL_SECONDS, help="seconds per game")

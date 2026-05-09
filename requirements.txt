@@ -1,4 +1,4 @@
 arc-agi-3>=0.0.1
 arcengine>=0.9.3
-anthropic>=0.40
+openai>=1.0
 python-dotenv>=1.0

@@ -7,7 +7,6 @@ during the migration to the real ``arc_agi_3`` SDK. Import it directly
 """
 from .world_model import WorldModel, Transition, ScoreEvent, ObjectTrace
 from .explorer import ProbeReport, detect_objects
-from .offline_controller import OfflineControllerAgent
 
 __all__ = [
     "WorldModel",
@@ -18,3 +17,11 @@ __all__ = [
     "detect_objects",
     "OfflineControllerAgent",
 ]
+
+
+def __getattr__(name: str):
+    if name == "OfflineControllerAgent":
+        from .offline_controller import OfflineControllerAgent
+
+        return OfflineControllerAgent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

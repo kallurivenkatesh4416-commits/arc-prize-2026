@@ -32,8 +32,7 @@ import re
 from typing import Any
 
 import arc_agi_3
-from arc_agi_3 import GameState
-from arcengine import GameAction
+from arc_agi_3 import GameAction, GameState
 
 from .explorer import (
     CLICK_ACTION,
@@ -118,10 +117,9 @@ class OfflineControllerAgent(arc_agi_3.Agent):
         # 2. Update world model from prev → latest using the previous frame
         #    in ``frames`` (the SDK appends the latest frame to ``frames``).
         #
-        #    NOTE: ``prev.action_input.id`` is an ``arc_agi_3.GameAction``
-        #    enum, which is a *different* class from ``arcengine.GameAction``
-        #    even though they have matching names/values. We compare on
-        #    ``.name`` to avoid ``is`` mismatches between the two hierarchies.
+        #    NOTE: ``prev.action_input.id`` is the SDK ``GameAction`` enum.
+        #    Keep this controller on that enum end-to-end so Agent.take_action
+        #    sees the exact type it expects, especially for RESET card_id setup.
         if frames and len(frames) >= 2:
             prev = frames[-2]
             try:
@@ -158,9 +156,6 @@ class OfflineControllerAgent(arc_agi_3.Agent):
         return action
 
     def _action_label(self, action_id: Any, data: dict[str, Any]) -> str:
-        # ``action_id`` may be either ``arc_agi_3.GameAction`` (from
-        # FrameData.action_input) or ``arcengine.GameAction``; compare via
-        # ``.name`` to support both.
         name = getattr(action_id, "name", str(action_id))
         if name == "ACTION6" and isinstance(data, dict):
             return f"ACTION6({data.get('x')},{data.get('y')})"
